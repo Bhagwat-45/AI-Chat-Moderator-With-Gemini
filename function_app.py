@@ -6,11 +6,29 @@ from datetime import datetime, timezone
 
 import azure.functions as func
 from azure.cosmos import CosmosClient, exceptions
+from moderations import check_message
 
 app = func.FunctionApp()
 
 DATABASE_NAME = "streamingdb"
 CONTAINER_NAME = "messages"
+
+
+VIOLATIONS_CONTAINER_NAME = "violations"
+
+
+def get_violations_container():
+    connection_string = os.getenv("COSMOS_CONNECTION_STRING")
+    if not connection_string:
+        return None
+
+    try:
+        client = CosmosClient.from_connection_string(connection_string)
+        database = client.get_database_client(DATABASE_NAME)
+        return database.get_container_client(VIOLATIONS_CONTAINER_NAME)
+    except exceptions.CosmosHttpResponseError as e:
+        logging.warning(f"Violations container access failed: {e}")
+        return None
 
 
 def get_container():
@@ -29,7 +47,6 @@ def get_container():
     except exceptions.CosmosHttpResponseError as e:
         logging.warning(f"Cosmos DB connection failed: {e}")
         return None
-
 
 @app.route(route="message", methods=["POST"])
 def create_message(req: func.HttpRequest) -> func.HttpResponse:
@@ -52,35 +69,63 @@ def create_message(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json"
         )
 
+    # 🔍 Moderation check
+    moderation_result = check_message(content)
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+
+    # 🚫 Blocked message path
+    if not moderation_result["is_allowed"]:
+        violation = {
+            "id": str(uuid.uuid4()),
+            "content": content,
+            "username": username,
+            "category": moderation_result["category"],
+            "confidence": moderation_result["confidence"],
+            "reason": moderation_result["reason"],
+            "timestamp": timestamp
+        }
+
+        violations_container = get_violations_container()
+        if violations_container:
+            try:
+                violations_container.create_item(body=violation)
+            except exceptions.CosmosHttpResponseError as e:
+                logging.error(f"Failed to write violation: {e}")
+
+        return func.HttpResponse(
+            json.dumps({
+                "error": "Message rejected",
+                "category": moderation_result["category"],
+                "reason": moderation_result["reason"]
+            }),
+            status_code=403,
+            mimetype="application/json"
+        )
+
+    # ✅ Allowed message path
     message = {
-        "id": str(uuid.uuid4()),  # required for Cosmos DB
+        "id": str(uuid.uuid4()),
         "content": content,
         "username": username,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": timestamp
     }
 
     container = get_container()
-    if not container:
-        logging.warning("Cosmos DB not configured. Message not persisted.")
-        return func.HttpResponse(
-            json.dumps(message),
-            status_code=201,
-            mimetype="application/json"
-        )
-
-    try:
-        container.create_item(body=message)
-    except exceptions.CosmosHttpResponseError as e:
-        logging.error(f"Failed to write to Cosmos DB: {e}")
-        return func.HttpResponse(
-            json.dumps({"error": "Failed to store message"}),
-            status_code=500,
-            mimetype="application/json"
-        )
+    if container:
+        try:
+            container.create_item(body=message)
+        except exceptions.CosmosHttpResponseError as e:
+            logging.error(f"Failed to write message: {e}")
+            return func.HttpResponse(
+                json.dumps({"error": "Failed to store message"}),
+                status_code=500,
+                mimetype="application/json"
+            )
 
     return func.HttpResponse(
         json.dumps(message),
-        status_code=201,
+        status_code=200,
         mimetype="application/json"
     )
 
